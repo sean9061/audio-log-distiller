@@ -1,0 +1,22 @@
+# 環境設定
+.env
+
+# 音声・出力ファイル
+audios/*
+!audios/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# モデル
+models/
+
+# ビルド成果物
+build/
+
+# macOS
+.DS_Store
