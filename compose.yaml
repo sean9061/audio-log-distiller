@@ -1,0 +1,29 @@
+name: audio-log-distiller
+
+services:
+  audio-log-distiller:
+    build: .
+    container_name: audio-log-distiller
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    networks:
+      - proxy_net
+      - ollama_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
+
+networks:
+  proxy_net:
+    external: true
+  ollama_net:
+    external: true

@@ -125,7 +125,12 @@ def main() -> None:
         convert_to_wav(audio_path, wav_path)
 
         print("pyannote モデルをロード中...", flush=True)
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             token=hf_token,
@@ -137,7 +142,17 @@ def main() -> None:
         diarize_kwargs = {}
         if args.speakers:
             diarize_kwargs["num_speakers"] = args.speakers
-        output = pipeline(str(wav_path), **diarize_kwargs)
+
+        # torchcodec が動作しない環境向けに soundfile で事前ロードして dict で渡す
+        import soundfile as sf
+        waveform_np, sample_rate = sf.read(str(wav_path), dtype="float32")
+        if waveform_np.ndim == 1:
+            waveform = torch.from_numpy(waveform_np).unsqueeze(0)
+        else:
+            waveform = torch.from_numpy(waveform_np.T)
+        audio_input = {"waveform": waveform, "sample_rate": sample_rate}
+
+        output = pipeline(audio_input, **diarize_kwargs)
         # pyannote 3.x は DiarizeOutput (dataclass) を返す
         diarization = output.speaker_diarization if hasattr(output, "speaker_diarization") else output
 

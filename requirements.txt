@@ -1,3 +1,11 @@
-anthropic
 pyannote.audio
-torch
+soundfile
+# torch is installed separately in Dockerfile with the correct CUDA index URL
+
+# Web API
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Transcription backend (replaces whisper.cpp; GPU-accelerated via CTranslate2)
+faster-whisper>=1.0.0
