@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hmac
 import json
 import os
 import re
@@ -14,8 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+import jwt
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 UPLOAD_DIR = Path("/tmp/audio_jobs")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -26,6 +28,57 @@ HISTORY_DIR = Path(os.environ.get("HISTORY_DIR", "/data/history"))
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 _ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")  # uuid4 形式のみ許可（パストラバーサル防止）
+
+# ── 認証（dashboard と同方式: JWT クッキー） ──────────────────────────
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+COOKIE_NAME = "numa_token"
+JWT_EXPIRY_SEC = 24 * 60 * 60  # 24h
+# 認証不要なパス（ログイン画面・ログインAPI・状態確認・ログアウト）
+PUBLIC_PATHS = {"/login.html", "/auth/login", "/auth/check", "/auth/logout", "/favicon.ico"}
+# ログイン試行のレートリミット（15分に15回）
+_RL_WINDOW, _RL_MAX = 15 * 60, 15
+_login_attempts: dict[str, list[float]] = {}
+
+if not AUTH_PASSWORD or not JWT_SECRET:
+    print(
+        "[auth] WARNING: AUTH_PASSWORD / JWT_SECRET 未設定。全アクセスを拒否します。",
+        file=sys.stderr,
+    )
+
+
+def _make_token() -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {"auth": True, "iat": now, "exp": now + JWT_EXPIRY_SEC},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+
+def _token_valid(token: str | None) -> bool:
+    if not token or not JWT_SECRET:
+        return False
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        return False
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")  # NPM 経由の実クライアントIP
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _rate_limited(ip: str) -> bool:
+    now = time.time()
+    arr = [t for t in _login_attempts.get(ip, []) if now - t < _RL_WINDOW]
+    arr.append(now)
+    _login_attempts[ip] = arr
+    return len(arr) > _RL_MAX
 
 VALID_MODELS = {"tiny", "small", "medium", "large-v3"}
 
@@ -53,6 +106,61 @@ SUMMARY_PROMPTS: dict[str, str] = {
 }
 
 app = FastAPI(title="Audio Log Distiller")
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """全リクエストを保護。未認証は /login.html へリダイレクト（API は 401）。"""
+    path = request.url.path
+    if path in PUBLIC_PATHS or _token_valid(request.cookies.get(COOKIE_NAME)):
+        return await call_next(request)
+    if path.startswith("/api") or path.startswith("/auth"):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return RedirectResponse("/login.html")
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    ip = _client_ip(request)
+    if _rate_limited(ip):
+        return JSONResponse(
+            {"error": "Too many attempts, please try again later"}, status_code=429
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    password = (body or {}).get("password")
+    if not password:
+        return JSONResponse({"error": "Password required"}, status_code=400)
+    if not AUTH_PASSWORD or not hmac.compare_digest(str(password), AUTH_PASSWORD):
+        return JSONResponse({"error": "Invalid password"}, status_code=401)
+
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        COOKIE_NAME,
+        _make_token(),
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=JWT_EXPIRY_SEC,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE_NAME, path="/")
+    return resp
+
+
+@app.get("/auth/check")
+async def auth_check(request: Request):
+    return {"authenticated": _token_valid(request.cookies.get(COOKIE_NAME))}
+
+
 _executor = ThreadPoolExecutor(max_workers=1)  # one job at a time — GPU is shared
 jobs: dict[str, dict] = {}
 
@@ -88,6 +196,48 @@ def _persist_history(job_id: str) -> None:
         tmp.replace(_history_path(job_id))  # 原子的に差し替え
     except Exception:
         pass
+
+
+def _update_history_summary(
+    history_id: str, summary: str, summary_type: str, ollama_model: str
+) -> None:
+    """履歴レコードの要約を差し替える（再要約時に呼ぶ）。"""
+    p = _history_path(history_id)
+    if not p.exists():
+        return
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec.setdefault("result", {})
+        rec["result"]["summary"] = summary
+        rec["result"].pop("summary_error", None)
+        rec["summary_type"] = summary_type
+        rec["ollama_model"] = ollama_model
+        rec["resummarized_at"] = time.time()
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _resummarize_job(
+    job_id: str,
+    history_id: str,
+    transcript: str,
+    summary_type: str,
+    ollama_model: str,
+) -> None:
+    """保存済み文字起こしから要約を再生成し、履歴レコードを更新する。"""
+    try:
+        jobs[job_id]["status"] = "summarizing"
+        jobs[job_id]["partial_summary"] = ""
+        summary = _summarize_with_ollama(transcript, job_id, summary_type, ollama_model)
+        jobs[job_id]["result"] = {"summary": summary}
+        jobs[job_id]["status"] = "done"
+        _update_history_summary(history_id, summary, summary_type, ollama_model)
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)[:300]
 
 
 def _load_whisper_model(model_size: str):
@@ -430,6 +580,48 @@ async def delete_history(job_id: str):
     return {"ok": True}
 
 
+@app.post("/api/history/{job_id}/resummarize")
+async def resummarize_history(job_id: str, request: Request):
+    """保存済み文字起こしから要約を再生成する（シナリオ/モデル変更可）。
+    元音声は処理後に削除されるため文字起こしの再実行は不可。"""
+    if not _ID_RE.match(job_id):
+        raise HTTPException(400, "Invalid id")
+    p = _history_path(job_id)
+    if not p.exists():
+        raise HTTPException(404, "Not found")
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    transcript = (rec.get("result") or {}).get("transcript")
+    if not transcript or not transcript.strip():
+        raise HTTPException(400, "この履歴には文字起こしがないため再要約できません")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    summary_type = body.get("summary_type", "general")
+    summary_type = summary_type if summary_type in SUMMARY_PROMPTS else "general"
+    ollama_model = str(body.get("ollama_model", "")).strip()
+
+    new_job_id = str(uuid.uuid4())
+    jobs[new_job_id] = {
+        "status": "queued",
+        "filename": rec.get("filename"),
+        "result": None,
+        "error": None,
+    }
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(
+        _executor,
+        _resummarize_job,
+        new_job_id,
+        job_id,
+        transcript,
+        summary_type,
+        ollama_model,
+    )
+    return {"job_id": new_job_id}
+
+
 @app.get("/api/models")
 async def list_models():
     ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434")
@@ -441,6 +633,11 @@ async def list_models():
     except Exception:
         models = []
     return {"models": models}
+
+
+@app.get("/login.html", response_class=HTMLResponse)
+async def login_page():
+    return (Path(__file__).parent / "templates" / "login.html").read_text(encoding="utf-8")
 
 
 @app.get("/", response_class=HTMLResponse)

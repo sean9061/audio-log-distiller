@@ -6,6 +6,7 @@ soundfile
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
+PyJWT>=2.8.0
 
 # Transcription backend (replaces whisper.cpp; GPU-accelerated via CTranslate2)
 faster-whisper>=1.0.0

@@ -24,9 +24,14 @@
       <h1 class="text-xl font-bold tracking-tight">Audio Log Distiller</h1>
       <p class="text-slate-500 text-xs mt-0.5">文字起こし / 話者識別 / Ollama 要約</p>
     </div>
-    <button id="history-toggle" class="flex-shrink-0 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-lg transition-colors">
-      🗂 履歴
-    </button>
+    <div class="flex-shrink-0 flex items-center gap-2">
+      <button id="history-toggle" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-lg transition-colors">
+        🗂 履歴
+      </button>
+      <button id="logout-btn" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-400 px-3 py-1.5 rounded-lg transition-colors" title="ログアウト">
+        ログアウト
+      </button>
+    </div>
   </div>
 
   <!-- History Panel -->
@@ -140,6 +145,33 @@
         <div id="status-text" class="text-sm text-slate-300"></div>
         <div id="error-detail" class="hidden mt-1 text-xs text-red-400 break-all"></div>
       </div>
+    </div>
+
+    <!-- Re-summarize (history view only) -->
+    <div id="resummarize-panel" class="hidden bg-slate-900 border border-indigo-900/40 rounded-xl p-4 space-y-3">
+      <span class="text-xs font-semibold text-indigo-400 uppercase tracking-wider">要約を再生成</span>
+      <div class="grid grid-cols-2 gap-2">
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">シナリオ</label>
+          <select id="re-summary-type" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
+            <option value="general">汎用</option>
+            <option value="lecture">大学の講義</option>
+            <option value="meeting">仕事のミーティング</option>
+            <option value="casual">雑談</option>
+            <option value="briefing">説明会</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">LLM モデル</label>
+          <select id="re-ollama-model" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
+            <option value="">デフォルト (.env)</option>
+          </select>
+        </div>
+      </div>
+      <button id="resummarize-btn" class="w-full bg-indigo-700 hover:bg-indigo-600 disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed text-white text-sm font-medium py-2 rounded-lg transition-colors">
+        🔄 この文字起こしから要約を再生成
+      </button>
+      <div id="resummarize-note" class="hidden text-xs text-amber-400 break-all"></div>
     </div>
 
     <!-- Transcript -->
@@ -407,8 +439,9 @@ function resetToForm() {
   form.style.opacity = '';
   form.style.pointerEvents = '';
   ['result-section','result-transcript','result-diarized','result-summary',
-   'result-summary-error','new-job-btn','back-to-history-btn'].forEach(id =>
+   'result-summary-error','new-job-btn','back-to-history-btn','resummarize-panel'].forEach(id =>
     document.getElementById(id).classList.add('hidden'));
+  currentHistoryId = null;
 }
 
 document.getElementById('new-job-btn').addEventListener('click', resetToForm);
@@ -417,6 +450,26 @@ document.getElementById('new-job-btn').addEventListener('click', resetToForm);
 const SUMMARY_TYPE_LABELS = {
   general: '汎用', lecture: '講義', meeting: 'ミーティング', casual: '雑談', briefing: '説明会',
 };
+let currentHistoryId = null;  // 詳細表示中の履歴ID（再要約に使用）
+
+// Ollama モデル一覧（キャッシュ）
+let _modelsCache = null;
+async function getModels() {
+  if (_modelsCache) return _modelsCache;
+  try { _modelsCache = (await fetch('/api/models').then(r => r.json())).models || []; }
+  catch (_) { _modelsCache = []; }
+  return _modelsCache;
+}
+async function populateModelSelect(sel, selected) {
+  const models = await getModels();
+  [...sel.querySelectorAll('option')].slice(1).forEach(o => o.remove());  // 先頭(デフォルト)は残す
+  models.forEach(name => {
+    const o = document.createElement('option');
+    o.value = name; o.textContent = name;
+    sel.appendChild(o);
+  });
+  sel.value = selected && models.includes(selected) ? selected : '';
+}
 
 function fmtDate(ts) {
   if (!ts) return '';
@@ -491,10 +544,79 @@ async function viewHistoryItem(id, { keepHistoryOpen = false } = {}) {
     `${rec.filename || ''} — ${fmtDate(rec.created_at)}`;
 
   if (rec.result) showResults(rec.result);
+
+  // 再要約パネル: 文字起こしが残っていれば表示（元音声は削除済みのため再要約のみ）
+  currentHistoryId = id;
+  const hasTranscript = !!(rec.result && rec.result.transcript && rec.result.transcript.trim());
+  const panel = document.getElementById('resummarize-panel');
+  document.getElementById('resummarize-note').classList.add('hidden');
+  document.getElementById('resummarize-btn').disabled = false;
+  panel.classList.toggle('hidden', !hasTranscript);
+  if (hasTranscript) {
+    document.getElementById('re-summary-type').value = rec.summary_type || 'general';
+    await populateModelSelect(document.getElementById('re-ollama-model'), rec.ollama_model || '');
+  }
+
   document.getElementById('back-to-history-btn').classList.remove('hidden');
   document.getElementById('new-job-btn').classList.remove('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
   return true;
+}
+
+async function doResummarize() {
+  if (!currentHistoryId) return;
+  const btn = document.getElementById('resummarize-btn');
+  const note = document.getElementById('resummarize-note');
+  note.classList.add('hidden');
+  btn.disabled = true;
+  const summary_type = document.getElementById('re-summary-type').value;
+  const ollama_model = document.getElementById('re-ollama-model').value;
+  try {
+    const res = await fetch(`/api/history/${currentHistoryId}/resummarize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary_type, ollama_model }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+    const { job_id } = await res.json();
+    document.getElementById('summary-content').textContent = '';
+    document.getElementById('result-summary').classList.remove('hidden');
+    document.getElementById('result-summary-error').classList.add('hidden');
+    document.getElementById('summary-streaming').classList.remove('hidden');
+    document.getElementById('result-summary').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    pollResummarize(job_id);
+  } catch (e) {
+    btn.disabled = false;
+    note.textContent = e.message;
+    note.classList.remove('hidden');
+  }
+}
+
+function pollResummarize(jobId) {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try {
+      const job = await fetch(`/api/jobs/${jobId}`).then(r => r.json());
+      if (!job.status) { clearInterval(pollTimer); return; }
+      if (job.partial_summary != null) {
+        document.getElementById('summary-content').textContent = job.partial_summary;
+        document.getElementById('result-summary').classList.remove('hidden');
+      }
+      if (job.status === 'done') {
+        clearInterval(pollTimer);
+        document.getElementById('summary-streaming').classList.add('hidden');
+        if (job.result && job.result.summary != null)
+          document.getElementById('summary-content').textContent = job.result.summary;
+        document.getElementById('resummarize-btn').disabled = false;
+      } else if (job.status === 'error') {
+        clearInterval(pollTimer);
+        document.getElementById('summary-streaming').classList.add('hidden');
+        document.getElementById('summary-error-detail').textContent = job.error || '再要約に失敗しました';
+        document.getElementById('result-summary-error').classList.remove('hidden');
+        document.getElementById('resummarize-btn').disabled = false;
+      }
+    } catch (_) { /* network hiccup — keep polling */ }
+  }, 1500);
 }
 
 async function deleteHistoryItem(id) {
@@ -515,6 +637,11 @@ document.getElementById('history-toggle').addEventListener('click', () => {
   if (show) loadHistory();
 });
 document.getElementById('history-refresh').addEventListener('click', loadHistory);
+document.getElementById('resummarize-btn').addEventListener('click', doResummarize);
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  try { await fetch('/auth/logout', { method: 'POST' }); } catch (_) {}
+  location.replace('/login.html');
+});
 document.getElementById('back-to-history-btn').addEventListener('click', () => {
   resetToForm();
   const sec = document.getElementById('history-section');
