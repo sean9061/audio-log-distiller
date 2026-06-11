@@ -77,15 +77,36 @@ def _sec_to_ts(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:06.3f}".replace(".", ",")
 
 
-def _summarize_with_ollama(transcript: str, job_id: str, summary_type: str = "general") -> str:
+def _summarize_with_ollama(
+    transcript: str, job_id: str, summary_type: str = "general", ollama_model: str = ""
+) -> str:
     ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-    model = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+    model = ollama_model or os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 
     prefix = SUMMARY_PROMPTS.get(summary_type, SUMMARY_PROMPTS["general"])
     prompt = prefix + transcript
 
+    # コンテキスト長を入力サイズに合わせて動的に確保する。
+    # Ollama のデフォルト num_ctx=4096 では長い文字起こしがコンテキスト枠を
+    # 使い切り、(1) 先頭の指示文が切り捨てられ (2) 生成余地が残らず1トークンで
+    # 打ち切られる（要約が1文字しか出ない）。入力＋出力が収まる長さを確保する。
+    # 日本語は概ね 0.6 token/文字。num_predict 分の生成余地も上乗せする。
+    NUM_PREDICT = 2048
+    est_prompt_tokens = int(len(prompt) * 0.6) + 256
+    need = est_prompt_tokens + NUM_PREDICT
+    num_ctx = min(32768, max(8192, ((need + 4095) // 4096) * 4096))
+
+    # think を無効化: qwen3 系の thinking モデルは要約タスクでも長大な思考を
+    # 出力し、本文(response)が出る前に出力上限へ達して response が空のまま
+    # 完了することがある（→ 要約が表示されない）。思考を切り本文を直接出させる。
     payload = json.dumps(
-        {"model": model, "prompt": prompt, "stream": True}
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "think": False,
+            "options": {"num_ctx": num_ctx, "num_predict": NUM_PREDICT},
+        }
     ).encode("utf-8")
 
     req = urllib.request.Request(
@@ -96,18 +117,21 @@ def _summarize_with_ollama(transcript: str, job_id: str, summary_type: str = "ge
     )
 
     accumulated = ""
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    thinking = ""
+    with urllib.request.urlopen(req, timeout=900) as resp:
         for raw_line in resp:
             line = raw_line.strip()
             if not line:
                 continue
             chunk = json.loads(line.decode("utf-8"))
             accumulated += chunk.get("response", "")
+            thinking += chunk.get("thinking") or ""
             jobs[job_id]["partial_summary"] = accumulated
             if chunk.get("done"):
                 break
 
-    return accumulated.strip()
+    # 万一 response が空（モデルが think:false を無視した等）でも思考内容を返す
+    return accumulated.strip() or thinking.strip()
 
 
 def _process_job(
@@ -119,6 +143,7 @@ def _process_job(
     num_speakers: Optional[int],
     do_summarize: bool,
     summary_type: str,
+    ollama_model: str,
 ) -> None:
     whisper_json_path = Path(audio_path + ".json")
     diarized_json_path = Path(audio_path + ".diarized.json")
@@ -167,7 +192,7 @@ def _process_job(
 
             def _run_summary() -> None:
                 try:
-                    summary_slot["value"] = _summarize_with_ollama(plain_transcript, job_id, summary_type)
+                    summary_slot["value"] = _summarize_with_ollama(plain_transcript, job_id, summary_type, ollama_model)
                 except Exception as e:
                     summary_slot["error"] = str(e)[:300]
 
@@ -246,6 +271,7 @@ async def create_job(
     speakers: str = Form(""),
     summarize: str = Form("true"),
     summary_type: str = Form("general"),
+    ollama_model: str = Form(""),
 ):
     if model not in VALID_MODELS:
         raise HTTPException(400, f"model must be one of {VALID_MODELS}")
@@ -276,6 +302,7 @@ async def create_job(
         int(speakers) if speakers.strip().isdigit() else None,
         summarize.lower() == "true",
         summary_type if summary_type in SUMMARY_PROMPTS else "general",
+        ollama_model.strip(),
     )
 
     return {"job_id": job_id}
@@ -287,6 +314,19 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.get("/api/models")
+async def list_models():
+    ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+    try:
+        req = urllib.request.Request(f"{ollama_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        models = [m["name"] for m in data.get("models", [])]
+    except Exception:
+        models = []
+    return {"models": models}
 
 
 @app.get("/", response_class=HTMLResponse)
