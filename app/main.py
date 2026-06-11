@@ -2,10 +2,12 @@ import asyncio
 import gc
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,13 @@ from fastapi.responses import HTMLResponse
 
 UPLOAD_DIR = Path("/tmp/audio_jobs")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# 履歴の永続化先（compose で /data をボリュームにマウント）。ジョブ完了時に
+# 結果をここへ保存し、ページを閉じても/再起動しても過去データを参照できる。
+HISTORY_DIR = Path(os.environ.get("HISTORY_DIR", "/data/history"))
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")  # uuid4 形式のみ許可（パストラバーサル防止）
 
 VALID_MODELS = {"tiny", "small", "medium", "large-v3"}
 
@@ -48,6 +57,37 @@ _executor = ThreadPoolExecutor(max_workers=1)  # one job at a time — GPU is sh
 jobs: dict[str, dict] = {}
 
 _model_cache: dict = {}  # {"obj": WhisperModel, "name": str}
+
+
+def _history_path(job_id: str) -> Path:
+    return HISTORY_DIR / f"{job_id}.json"
+
+
+def _persist_history(job_id: str) -> None:
+    """完了/失敗したジョブをディスクへ保存する（履歴として永続化）。"""
+    job = jobs.get(job_id)
+    if not job:
+        return
+    record = {
+        "id": job_id,
+        "filename": job.get("filename"),
+        "created_at": job.get("created_at"),
+        "finished_at": time.time(),
+        "status": job.get("status"),
+        "model": job.get("model"),
+        "language": job.get("language"),
+        "diarize": job.get("diarize"),
+        "summary_type": job.get("summary_type"),
+        "ollama_model": job.get("ollama_model"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+    try:
+        tmp = _history_path(job_id).with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_history_path(job_id))  # 原子的に差し替え
+    except Exception:
+        pass
 
 
 def _load_whisper_model(model_size: str):
@@ -260,6 +300,10 @@ def _process_job(
                 p.unlink(missing_ok=True)
             except Exception:
                 pass
+        # 終了状態（成功/失敗いずれも）を履歴に保存。クライアントが切断していても
+        # 処理は executor 上で継続しており、ここで確実に永続化される。
+        if jobs.get(job_id, {}).get("status") in ("done", "error"):
+            _persist_history(job_id)
 
 
 @app.post("/api/jobs")
@@ -283,11 +327,21 @@ async def create_job(
     with open(audio_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    do_diarize = diarize.lower() == "true"
+    summary_type = summary_type if summary_type in SUMMARY_PROMPTS else "general"
+    ollama_model = ollama_model.strip()
+
     jobs[job_id] = {
         "status": "queued",
         "filename": file.filename,
         "result": None,
         "error": None,
+        "created_at": time.time(),
+        "model": model,
+        "language": language,
+        "diarize": do_diarize,
+        "summary_type": summary_type,
+        "ollama_model": ollama_model,
     }
 
     loop = asyncio.get_running_loop()
@@ -298,11 +352,11 @@ async def create_job(
         str(audio_path),
         model,
         language,
-        diarize.lower() == "true",
+        do_diarize,
         int(speakers) if speakers.strip().isdigit() else None,
         summarize.lower() == "true",
-        summary_type if summary_type in SUMMARY_PROMPTS else "general",
-        ollama_model.strip(),
+        summary_type,
+        ollama_model,
     )
 
     return {"job_id": job_id}
@@ -314,6 +368,66 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.get("/api/history")
+async def list_history():
+    """保存済み履歴の一覧（メタ情報のみ・新しい順）。"""
+    items = []
+    for p in HISTORY_DIR.glob("*.json"):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        result = rec.get("result") or {}
+        items.append(
+            {
+                "id": rec.get("id"),
+                "filename": rec.get("filename"),
+                "created_at": rec.get("created_at"),
+                "finished_at": rec.get("finished_at"),
+                "status": rec.get("status"),
+                "model": rec.get("model"),
+                "language": rec.get("language"),
+                "summary_type": rec.get("summary_type"),
+                "has_summary": bool(result.get("summary")),
+                "has_diarized": bool(result.get("diarized_transcript")),
+                "preview": (
+                    result.get("summary")
+                    or result.get("transcript")
+                    or rec.get("error")
+                    or ""
+                )[:120],
+            }
+        )
+    items.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
+    return {"history": items}
+
+
+@app.get("/api/history/{job_id}")
+async def get_history(job_id: str):
+    """履歴の詳細。永続化済みファイルを優先し、なければ実行中ジョブを返す。"""
+    if not _ID_RE.match(job_id):
+        raise HTTPException(400, "Invalid id")
+    p = _history_path(job_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            raise HTTPException(500, "Failed to read history")
+    job = jobs.get(job_id)
+    if job:
+        return {"id": job_id, **job}
+    raise HTTPException(404, "Not found")
+
+
+@app.delete("/api/history/{job_id}")
+async def delete_history(job_id: str):
+    if not _ID_RE.match(job_id):
+        raise HTTPException(400, "Invalid id")
+    _history_path(job_id).unlink(missing_ok=True)
+    jobs.pop(job_id, None)
+    return {"ok": True}
 
 
 @app.get("/api/models")

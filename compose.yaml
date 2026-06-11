@@ -8,6 +8,7 @@ services:
     env_file: .env
     volumes:
       - hf-cache:/root/.cache/huggingface
+      - history:/data
     networks:
       - proxy_net
       - ollama_net
@@ -21,6 +22,7 @@ services:
 
 volumes:
   hf-cache:
+  history:
 
 networks:
   proxy_net:
